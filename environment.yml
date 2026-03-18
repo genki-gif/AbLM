@@ -1,0 +1,27 @@
+name: ablm
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - jupyter
+  - ipykernel
+  - bioconda::anarci
+  - bioconda::abnumber
+  - pip:
+    - antiberty
+    - ablang
+    - ablang2
+    - torch
+    - umap-learn
+    - matplotlib
+    - seaborn
+    - pandas
+    - requests
+    - tqdm
+    - scikit-learn
+    - numpy
+    - olga
+    - numba
