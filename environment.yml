@@ -15,6 +15,7 @@ dependencies:
     - ablang
     - ablang2
     - torch
+    - "transformers==4.46.3"
     - umap-learn
     - matplotlib
     - seaborn

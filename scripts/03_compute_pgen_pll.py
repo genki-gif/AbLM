@@ -207,6 +207,7 @@ def run_antiberty_pll(
     vh_seqs: list[str],
     cdr3_indices: list,
     inner_batch: int,
+    device: str,
     out_dir: Path,
 ) -> None:
     full_path = out_dir / "antiberty_pll.npy"
@@ -219,6 +220,10 @@ def run_antiberty_pll(
 
     log.info("AntiBERTy PLL: モデル読み込み中 ...")
     runner = AntiBERTyRunner()
+    if device != "cpu":
+        runner.model.to(device)
+        runner.device = torch.device(device)
+        log.info(f"AntiBERTy PLL: モデルを {device} に移動")
 
     full_plls: list[float] = []
     cdr3_plls: list[float] = []
@@ -226,9 +231,9 @@ def run_antiberty_pll(
     for vh, idx in tqdm(
         zip(vh_seqs, cdr3_indices), total=len(vh_seqs), desc="AntiBERTy PLL"
     ):
-        # 全配列 PLL (内蔵関数使用)
-        pll_tensor = runner.pseudo_log_likelihood([vh], batch_size=inner_batch)
-        full_plls.append(pll_tensor[0].item())
+        # 全配列 PLL (GPU 対応のカスタム実装を使用)
+        full_pll = _antiberty_cdr3_pll_single(runner, vh, 0, len(vh), inner_batch)
+        full_plls.append(full_pll)
 
         # CDR3-specific PLL
         if idx is not None:
@@ -298,6 +303,7 @@ def run_ablang_pll(
     vh_seqs: list[str],
     cdr3_indices: list,
     inner_batch: int,
+    device: str,
     out_dir: Path,
 ) -> None:
     full_path = out_dir / "ablang_pll.npy"
@@ -314,8 +320,10 @@ def run_ablang_pll(
 
     ab_model = model.AbLang
     ab_model.eval()
+    if device != "cpu":
+        ab_model.to(device)
+        log.info(f"AbLang PLL: モデルを {device} に移動")
     tok = model.tokenizer
-    device = model.used_device
 
     full_plls: list[float] = []
     cdr3_plls: list[float] = []
@@ -614,10 +622,10 @@ def main() -> None:
         run_pgen(df, data_dir)
 
     if "antiberty" in models_to_run:
-        run_antiberty_pll(vh_seqs, cdr3_indices, args.batch, data_dir)
+        run_antiberty_pll(vh_seqs, cdr3_indices, args.batch, device, data_dir)
 
     if "ablang" in models_to_run:
-        run_ablang_pll(vh_seqs, cdr3_indices, args.batch, data_dir)
+        run_ablang_pll(vh_seqs, cdr3_indices, args.batch, device, data_dir)
 
     if "ablang2" in models_to_run:
         run_ablang2_pll(vh_seqs, vl_seqs, cdr3_indices, inner_batch2, device, data_dir)

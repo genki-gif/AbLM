@@ -48,6 +48,15 @@ Icon
 *.log
 logs/
 
+# ジョブスクリプト・一時ファイル
+job/
+mamba*/
+mambaf*
+
+# ベンチマークデータ（大容量・再取得可能）
+benchmarks/*/repo/
+benchmarks/*/data/
+
 # 一時ファイル
 tmp/
 temp/
