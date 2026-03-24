@@ -26,3 +26,4 @@ dependencies:
     - numpy
     - olga
     - numba
+    - xgboost

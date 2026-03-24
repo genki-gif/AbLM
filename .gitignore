@@ -25,8 +25,10 @@ ENV/
 
 # データファイル（大容量 .npy / .csv）
 data/sequences_processed.csv
+data/**/*.npy
 data/*.npy
 data/pgen_pll_scores.csv
+data/therapeutic/pgen_pll_scores.csv
 
 # 生成図（再現可能）
 figures/*.png
@@ -48,8 +50,8 @@ Icon
 *.log
 logs/
 
-# ジョブスクリプト・一時ファイル
-job/
+# ジョブスクリプト・ログ（スクリプト自体は追跡、ログのみ除外）
+job/job_logs/
 mamba*/
 mambaf*
 
