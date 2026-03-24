@@ -1,6 +1,6 @@
 """
 02_generate_embeddings.py
-前処理済み配列から AntiBERTy・AbLang・AbLang-2 の埋め込みを生成して保存する。
+前処理済み配列から AntiBERTy・AbLang・AbLang-2・ESM-2・ProGen-2 の埋め込みを生成して保存する。
 
 入力:
     data/sequences_processed.csv   (01_download_data.py の出力)
@@ -14,6 +14,10 @@
     ablang2_cdr3_vecs.npy          AbLang-2 (VH+VL ペア入力) CDR-H3 レベル   (N, D)
     ablang2_heavy_seq_vecs.npy     AbLang-2 (VH 単独入力)   シーケンスレベル (N, D)
     ablang2_heavy_cdr3_vecs.npy    AbLang-2 (VH 単独入力)   CDR-H3 レベル   (N, D)
+    esm2_seq_vecs.npy              ESM-2 シーケンスレベルベクトル     (N, 1280)
+    esm2_cdr3_vecs.npy             ESM-2 CDR-H3 レベルベクトル       (N, 1280)
+    progen2_seq_vecs.npy           ProGen-2 シーケンスレベルベクトル  (N, 1024)
+    progen2_cdr3_vecs.npy          ProGen-2 CDR-H3 レベルベクトル    (N, 1024)
 
 トークン形式 (ablang2-paired):
     ペア  : [<, VH残基..., >, |, <, VL残基..., >]  → VH は index 1 〜 1+len(VH)
@@ -22,6 +26,8 @@
 使用方法:
     mamba run -n ablm python scripts/02_generate_embeddings.py [--batch 32] [--device cpu]
     mamba run -n ablm python scripts/02_generate_embeddings.py --model ablang2heavy
+    mamba run -n ablm python scripts/02_generate_embeddings.py --model esm2
+    mamba run -n ablm python scripts/02_generate_embeddings.py --model progen2
 """
 
 import argparse
@@ -249,11 +255,107 @@ def run_ablang2_heavy(
 
 
 # ──────────────────────────────────────────────
+# ESM-2
+# ──────────────────────────────────────────────
+
+def run_esm2(
+    vh_seqs: list[str],
+    cdr3_indices: list[tuple[int, int] | None],
+    batch_size: int,
+    device: str,
+    out_dir: Path,
+) -> None:
+    """ESM-2 (facebook/esm2_t33_650M_UR50D) の埋め込みを生成する。
+
+    トークンレイアウト: [CLS(0), AA_0(1), ..., AA_{L-1}(L), EOS(L+1)]
+    VH 残基の hidden state インデックス: 1 〜 1+len(seq)
+    """
+    seq_path = out_dir / "esm2_seq_vecs.npy"
+    cdr3_path = out_dir / "esm2_cdr3_vecs.npy"
+    if seq_path.exists() and cdr3_path.exists():
+        log.info("ESM-2: キャッシュを検出、スキップ")
+        return
+
+    from transformers import EsmModel, AutoTokenizer
+
+    MODEL_ID = "facebook/esm2_t33_650M_UR50D"
+    log.info(f"ESM-2: モデル読み込み中 ({MODEL_ID}) ...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = EsmModel.from_pretrained(MODEL_ID).to(device).eval()
+
+    res_embs: list[np.ndarray] = []
+
+    for i in tqdm(range(0, len(vh_seqs), batch_size), desc="ESM-2"):
+        batch = vh_seqs[i:i + batch_size]
+        enc = tokenizer(
+            batch, return_tensors="pt", padding=True,
+            truncation=True, add_special_tokens=True,
+        ).to(device)
+        with torch.no_grad():
+            out = model(**enc)
+        for j, seq in enumerate(batch):
+            # index 0 = CLS, index 1..L = VH残基, index L+1 = EOS
+            residue_embs = out.last_hidden_state[j, 1:1 + len(seq)].cpu().float().numpy()
+            res_embs.append(residue_embs)
+
+    np.save(seq_path, pool_seq(res_embs))
+    np.save(cdr3_path, pool_cdr3(res_embs, cdr3_indices))
+    log.info(f"ESM-2: 保存完了 → {seq_path}, {cdr3_path}")
+
+
+# ──────────────────────────────────────────────
+# ProGen-2
+# ──────────────────────────────────────────────
+
+def run_progen2(
+    vh_seqs: list[str],
+    cdr3_indices: list[tuple[int, int] | None],
+    device: str,
+    out_dir: Path,
+) -> None:
+    """ProGen-2 (hugohrban/progen2-base) の埋め込みを生成する。
+
+    Causal LM のため個別処理（パディング不要）。
+    トークンレイアウト: [BOS(0), AA_0(1), ..., AA_{L-1}(L), EOS(L+1)]
+    VH 残基の hidden state インデックス: 1 〜 1+len(seq)
+    """
+    seq_path = out_dir / "progen2_seq_vecs.npy"
+    cdr3_path = out_dir / "progen2_cdr3_vecs.npy"
+    if seq_path.exists() and cdr3_path.exists():
+        log.info("ProGen-2: キャッシュを検出、スキップ")
+        return
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    MODEL_ID = "hugohrban/progen2-base"
+    log.info(f"ProGen-2: モデル読み込み中 ({MODEL_ID}) ...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, trust_remote_code=True,
+    ).to(device).eval()
+
+    res_embs: list[np.ndarray] = []
+
+    for seq in tqdm(vh_seqs, desc="ProGen-2"):
+        enc = tokenizer(seq, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = model(**enc, output_hidden_states=True)
+        hidden = out.hidden_states[-1][0]  # (L_tok, D)
+        # BOS をスキップして VH 残基のみ抽出
+        residue_embs = hidden[1:1 + len(seq)].cpu().float().numpy()  # (L, D)
+        res_embs.append(residue_embs)
+
+    np.save(seq_path, pool_seq(res_embs))
+    np.save(cdr3_path, pool_cdr3(res_embs, cdr3_indices))
+    log.info(f"ProGen-2: 保存完了 → {seq_path}, {cdr3_path}")
+
+
+# ──────────────────────────────────────────────
 # メイン
 # ──────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="3 モデルの埋め込みを生成して保存する")
+    parser = argparse.ArgumentParser(description="5 モデルの埋め込みを生成して保存する")
     parser.add_argument("--datadir", type=str, default="data", help="データディレクトリ (default: data)")
     parser.add_argument("--batch", type=int, default=32, help="バッチサイズ (default: 32)")
     parser.add_argument(
@@ -262,7 +364,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model", type=str, default="all",
-        help="実行するモデル: all / antiberty / ablang / ablang2 / ablang2heavy (default: all)"
+        help="実行するモデル: all / antiberty / ablang / ablang2 / ablang2heavy / esm2 / progen2 (default: all)"
     )
     args = parser.parse_args()
 
@@ -302,7 +404,7 @@ def main() -> None:
 
     # 埋め込み生成
     models_to_run = set(
-        ["antiberty", "ablang", "ablang2", "ablang2heavy"]
+        ["antiberty", "ablang", "ablang2", "ablang2heavy", "esm2", "progen2"]
         if args.model == "all"
         else [args.model]
     )
@@ -321,6 +423,12 @@ def main() -> None:
 
     if "ablang2heavy" in models_to_run:
         run_ablang2_heavy(vh_seqs, cdr3_indices, batch2, device, data_dir)
+
+    if "esm2" in models_to_run:
+        run_esm2(vh_seqs, cdr3_indices, args.batch, device, data_dir)
+
+    if "progen2" in models_to_run:
+        run_progen2(vh_seqs, cdr3_indices, device, data_dir)
 
     log.info("全モデルの埋め込み生成完了")
 

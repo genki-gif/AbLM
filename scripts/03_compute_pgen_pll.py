@@ -64,6 +64,10 @@ SCORE_COLS = [
     "ablang2_paired_cdr3_pll",
     "ablang2_heavy_pll",
     "ablang2_heavy_cdr3_pll",
+    "esm2_pll",
+    "esm2_cdr3_pll",
+    "progen2_pll",
+    "progen2_cdr3_pll",
 ]
 
 
@@ -520,6 +524,159 @@ def run_ablang2_heavy_pll(
 
 
 # ──────────────────────────────────────────────
+# ESM-2 PLL (Masked LM)
+# ──────────────────────────────────────────────
+
+def _esm2_masked_pll(
+    model,
+    tokenizer,
+    vh: str,
+    positions: list[int],
+    device: str,
+    inner_batch: int = 16,
+) -> float:
+    """ESM-2 で指定残基位置の masked PLL を計算する。
+
+    トークンレイアウト: [CLS(0), AA_0(1), ..., AA_{L-1}(L), EOS(L+1)]
+    残基 i の token index = i + 1
+    """
+    if not positions:
+        return float("nan")
+
+    enc = tokenizer(vh, return_tensors="pt", add_special_tokens=True)
+    input_ids = enc["input_ids"].to(device)  # (1, L+2)
+
+    log_probs: list[float] = []
+    for k in range(0, len(positions), inner_batch):
+        pos_batch = positions[k:k + inner_batch]
+        masked = input_ids.repeat(len(pos_batch), 1)
+        for b, p in enumerate(pos_batch):
+            masked[b, p + 1] = tokenizer.mask_token_id  # +1 for CLS
+        with torch.no_grad():
+            logits = model(input_ids=masked).logits  # (B, L+2, vocab)
+        for b, p in enumerate(pos_batch):
+            true_id = input_ids[0, p + 1]
+            lp = torch.log_softmax(logits[b, p + 1], dim=-1)[true_id].item()
+            log_probs.append(lp)
+
+    return float(np.mean(log_probs))
+
+
+def run_esm2_pll(
+    vh_seqs: list[str],
+    cdr3_indices: list,
+    inner_batch: int,
+    device: str,
+    out_dir: Path,
+) -> None:
+    """ESM-2 (facebook/esm2_t33_650M_UR50D) の PLL を計算する。"""
+    full_path = out_dir / "esm2_pll.npy"
+    cdr3_path = out_dir / "esm2_cdr3_pll.npy"
+    if full_path.exists() and cdr3_path.exists():
+        log.info("ESM-2 PLL: キャッシュを検出、スキップ")
+        return
+
+    from transformers import EsmForMaskedLM, AutoTokenizer
+
+    MODEL_ID = "facebook/esm2_t33_650M_UR50D"
+    log.info(f"ESM-2 PLL: モデル読み込み中 ({MODEL_ID}) ...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = EsmForMaskedLM.from_pretrained(MODEL_ID).to(device).eval()
+
+    full_plls: list[float] = []
+    cdr3_plls: list[float] = []
+
+    for vh, idx in tqdm(
+        zip(vh_seqs, cdr3_indices), total=len(vh_seqs), desc="ESM-2 PLL"
+    ):
+        L = len(vh)
+        full_plls.append(
+            _esm2_masked_pll(model, tokenizer, vh, list(range(L)), device, inner_batch)
+        )
+        if idx is not None:
+            start, end = idx
+            if 0 <= start < end <= L:
+                cdr3_plls.append(
+                    _esm2_masked_pll(model, tokenizer, vh, list(range(start, end)), device, inner_batch)
+                )
+            else:
+                cdr3_plls.append(full_plls[-1])
+        else:
+            cdr3_plls.append(float("nan"))
+
+    np.save(full_path, np.array(full_plls, dtype=np.float32))
+    np.save(cdr3_path, np.array(cdr3_plls, dtype=np.float32))
+    log.info(f"ESM-2 PLL: 保存完了 → {full_path}, {cdr3_path}")
+
+
+# ──────────────────────────────────────────────
+# ProGen-2 PLL (Causal LM)
+# ──────────────────────────────────────────────
+
+def run_progen2_pll(
+    vh_seqs: list[str],
+    cdr3_indices: list,
+    device: str,
+    out_dir: Path,
+) -> None:
+    """ProGen-2 (hugohrban/progen2-base) の PLL を計算する。
+
+    Causal LM のため 1 回の forward pass で全ポジションの log P を取得できる。
+    logits[:, p, :] が位置 p+1 のトークンを予測する。
+    log P(AA_p | AA_{<p}) = log_softmax(logits[0, p])[token_id(AA_p)]
+    """
+    full_path = out_dir / "progen2_pll.npy"
+    cdr3_path = out_dir / "progen2_cdr3_pll.npy"
+    if full_path.exists() and cdr3_path.exists():
+        log.info("ProGen-2 PLL: キャッシュを検出、スキップ")
+        return
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    MODEL_ID = "hugohrban/progen2-base"
+    log.info(f"ProGen-2 PLL: モデル読み込み中 ({MODEL_ID}) ...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, trust_remote_code=True,
+    ).to(device).eval()
+
+    full_plls: list[float] = []
+    cdr3_plls: list[float] = []
+
+    for vh, idx in tqdm(
+        zip(vh_seqs, cdr3_indices), total=len(vh_seqs), desc="ProGen-2 PLL"
+    ):
+        enc = tokenizer(vh, return_tensors="pt").to(device)
+        input_ids = enc["input_ids"]  # (1, L_tok): [BOS, AA_0, ..., AA_{L-1}, EOS]
+        with torch.no_grad():
+            logits = model(input_ids).logits  # (1, L_tok, vocab)
+
+        # トークナイザーが truncate した場合に len(vh) > 実トークン数になるため、
+        # 実際に利用可能な AA トークン数を上限とする (BOS の分 -1)
+        L_tok = input_ids.shape[1]  # [BOS, AA_0, ..., AA_{L-1}(, EOS)]
+        L = min(len(vh), L_tok - 1)
+        log_probs: list[float] = []
+        for p in range(L):
+            true_id = input_ids[0, p + 1]  # BOS の次から p 番目のトークン
+            lp = torch.log_softmax(logits[0, p], dim=-1)[true_id].item()
+            log_probs.append(lp)
+        full_plls.append(float(np.mean(log_probs)))
+
+        if idx is not None:
+            start, end = idx
+            if 0 <= start < end <= L:
+                cdr3_plls.append(float(np.mean(log_probs[start:end])))
+            else:
+                cdr3_plls.append(full_plls[-1])
+        else:
+            cdr3_plls.append(float("nan"))
+
+    np.save(full_path, np.array(full_plls, dtype=np.float32))
+    np.save(cdr3_path, np.array(cdr3_plls, dtype=np.float32))
+    log.info(f"ProGen-2 PLL: 保存完了 → {full_path}, {cdr3_path}")
+
+
+# ──────────────────────────────────────────────
 # CSV 構築
 # ──────────────────────────────────────────────
 
@@ -572,7 +729,7 @@ def main() -> None:
         default="all",
         help=(
             "実行するモデル: "
-            "all / pgen / antiberty / ablang / ablang2 / ablang2heavy "
+            "all / pgen / antiberty / ablang / ablang2 / ablang2heavy / esm2 / progen2 "
             "(default: all)"
         ),
     )
@@ -611,7 +768,7 @@ def main() -> None:
     cdr3_indices = [parse_idx(v) for v in df["cdr3_indices"]]
 
     models_to_run = set(
-        ["pgen", "antiberty", "ablang", "ablang2", "ablang2heavy"]
+        ["pgen", "antiberty", "ablang", "ablang2", "ablang2heavy", "esm2", "progen2"]
         if args.model == "all"
         else [args.model]
     )
@@ -632,6 +789,12 @@ def main() -> None:
 
     if "ablang2heavy" in models_to_run:
         run_ablang2_heavy_pll(vh_seqs, cdr3_indices, inner_batch2, device, data_dir)
+
+    if "esm2" in models_to_run:
+        run_esm2_pll(vh_seqs, cdr3_indices, args.batch, device, data_dir)
+
+    if "progen2" in models_to_run:
+        run_progen2_pll(vh_seqs, cdr3_indices, device, data_dir)
 
     build_csv(df, data_dir)
     log.info("全モデルの PLL + Pgen 計算完了")
